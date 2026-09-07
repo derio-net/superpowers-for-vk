@@ -23,7 +23,9 @@ filesystem sandbox or a credential boundary: `~/.ssh`, `~/.aws` and friends are
 outside its scope (including when `$HOME` is a dotfiles git repo, which is not
 fr-enabled), and a session with no active pipeline sentinel is ungated by the
 bash guard entirely. Protecting those paths is the harness permission layer's
-job (`permissions.deny` in `~/.claude/settings.json`), not fr's.
+job (`permissions.deny` in `~/.claude/settings.json`), not fr's. Session
+bindings (`fr isolation attach`, `up --session`) are traceability only — the
+gate reads the marker, never a binding.
 
 To work here:
 

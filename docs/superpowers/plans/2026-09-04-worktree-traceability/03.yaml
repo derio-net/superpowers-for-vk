@@ -1,0 +1,139 @@
+schema_version: 2
+phase:
+  number: 3
+  title: Claude transports — fr-session-bind.sh (PostToolUse Bash) and fr-session-unbind.sh
+    (SessionEnd)
+  tag: agentic
+  depends_on:
+  - 1
+  tracking_issue: null
+  acceptance:
+  - session-workspace-binding
+tasks:
+- number: 1
+  title: RED — hook tests with a stub fr
+  steps:
+  - id: P3.T1.S1
+    text: |
+      RED: create tests/unit/test_hooks_session_bind.py (skip if no jq, like
+      test_hooks_sentinel.py). Fixture `stub_fr(tmp_path)`: writes
+      tmp_path/"bin"/"fr" =
+        #!/bin/bash
+        printf '%s\n' "$*" >> "$FR_STUB_LOG"
+      chmod 755, and returns an env dict {**os.environ, "PATH": f"{bin}:{PATH}",
+      "FR_STUB_LOG": str(tmp_path/"fr.log"), "HOME": str(tmp_path)}.
+      `run_hook(script, payload, env)` = subprocess.run(["bash", script], input=json,
+      capture_output=True, text=True, env=env). Payload builder for PostToolUse:
+      {"session_id": "sess-1", "cwd": <cwd>, "hook_event_name": "PostToolUse",
+       "tool_name": "Bash", "tool_input": {"command": <cmd>}, "tool_response": {}}.
+      Cases for hooks/fr-session-bind.sh (expected = the ONE line in fr.log, or no log file):
+      (a) `fr isolation up --branch feat/x` from cwd R →
+          `isolation attach --session sess-1 --repo R --branch feat/x --harness claude`;
+      (b) `fr isolation exec --branch feat/y -- pytest -q` → same with feat/y;
+      (c) `fr isolation up` (no --branch) → `... --repo R --harness claude` (no --branch);
+      (d) `cd /tmp/other && fr isolation up --branch feat/z` where /tmp/other
+          is tmp_path/"other" (exists) → `--repo <realpath of other>`;
+      (e) `fr isolation down --branch feat/x` → `isolation detach --session sess-1`;
+      (f) `git status` → no log file; `echo x && fr isolation up --branch a` → no log
+          (only a LEADING fr … matches, mirroring the guard);
+      (g) payload with "agent_id": "a1" → no log (subagents never rebind);
+      (h) tool_name "Read" → no log; exit code is 0 in every case.
+      Cases for hooks/fr-session-unbind.sh with
+      {"session_id": "sess-1", "hook_event_name": "SessionEnd", "reason": <r>}:
+      (i) reason "prompt_input_exit" → `isolation detach --session sess-1`;
+      (j) reason "resume" → no log; (k) missing session_id → no log; exit 0 always.
+      Run, confirm failures (scripts missing).
+- number: 2
+  title: GREEN — the two hooks + hooks.json
+  steps:
+  - id: P3.T2.S1
+    text: |
+      GREEN: create plugins/super-fr/hooks/fr-session-bind.sh (chmod 755):
+
+      #!/bin/bash
+      # PostToolUse(Bash): bind this session to the fr workspace the command just
+      # targeted (spec 2026-09-04 §5.B.1). Transport only — the engine is
+      # `fr isolation attach/detach`. Never blocks: exits 0 on every path, and an
+      # attach after a FAILED `up` finds no state and is a harmless no-op.
+      set -eu
+      input=$(cat)
+      command -v jq >/dev/null 2>&1 || exit 0
+      command -v fr >/dev/null 2>&1 || exit 0
+      [ "$(printf '%s' "$input" | jq -r '.tool_name // empty')" = "Bash" ] || exit 0
+      [ -z "$(printf '%s' "$input" | jq -r '.agent_id // empty')" ] || exit 0
+      session_id=$(printf '%s' "$input" | jq -r '.session_id // empty')
+      cwd=$(printf '%s' "$input" | jq -r '.cwd // empty')
+      command=$(printf '%s' "$input" | jq -r '.tool_input.command // empty')
+      [ -n "$session_id" ] && [ -n "$cwd" ] && [ -n "$command" ] || exit 0
+      first=$(printf '%s\n' "$command" | sed -n '1p')
+      repo="$cwd"
+      # Leading `cd <dir> &&|;` folds into --repo — same shape the guard strips (#421).
+      cd_re='^[[:space:]]*cd[[:space:]]+("([^"]+)"|'\''([^'\'']+)'\''|([^[:space:];&|]+))[[:space:]]*(&&|;)[[:space:]]*(.*)$'
+      cd_target=$(printf '%s' "$first" | sed -nE "s/$cd_re/\2\3\4/p")
+      if [ -n "$cd_target" ]; then
+        case "$cd_target" in "~"*) cd_target="$HOME${cd_target#\~}" ;; esac
+        repo=$(cd "$cwd" 2>/dev/null && cd "$cd_target" 2>/dev/null && pwd -P) || exit 0
+        first=$(printf '%s' "$first" | sed -nE "s/$cd_re/\6/p")
+      fi
+      verb=$(printf '%s' "$first" | sed -nE 's/^[[:space:]]*fr[[:space:]]+isolation[[:space:]]+(up|exec|down)([[:space:]]|$).*/\1/p')
+      [ -n "$verb" ] || exit 0
+      branch=$(printf '%s' "$first" | sed -nE 's/.*--branch(=|[[:space:]]+)("([^"]+)"|'\''([^'\'']+)'\''|([^[:space:]]+)).*/\3\4\5/p')
+      case "$verb" in
+        up|exec)
+          if [ -n "$branch" ]; then
+            fr isolation attach --session "$session_id" --repo "$repo" --branch "$branch" --harness claude >/dev/null 2>&1 || true
+          else
+            fr isolation attach --session "$session_id" --repo "$repo" --harness claude >/dev/null 2>&1 || true
+          fi ;;
+        down)
+          fr isolation detach --session "$session_id" >/dev/null 2>&1 || true ;;
+      esac
+      exit 0
+
+      Note the double-quoted sed with `$cd_re`: the `\2\3\4` group refs must survive —
+      write them as `\\2\\3\\4` inside double quotes if bash eats the backslashes; run
+      case (d) to verify.
+  - id: P3.T2.S2
+    text: |
+      GREEN: create plugins/super-fr/hooks/fr-session-unbind.sh (chmod 755):
+
+      #!/bin/bash
+      # SessionEnd: drop this session's workspace binding (spec 2026-09-04 §5.B.2).
+      # `resume` keeps the id and the worktree, so it is not an end for our purposes.
+      set -eu
+      input=$(cat)
+      command -v jq >/dev/null 2>&1 || exit 0
+      command -v fr >/dev/null 2>&1 || exit 0
+      [ "$(printf '%s' "$input" | jq -r '.reason // empty')" != "resume" ] || exit 0
+      session_id=$(printf '%s' "$input" | jq -r '.session_id // empty')
+      [ -n "$session_id" ] || exit 0
+      fr isolation detach --session "$session_id" >/dev/null 2>&1 || true
+      exit 0
+
+      In plugins/super-fr/hooks/hooks.json add under "PostToolUse" a second entry
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/fr-session-bind.sh"}]}
+      and a new top-level "SessionEnd": [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/fr-session-unbind.sh"}]}].
+      Update tests/unit/test_plugin_hooks.py: PostToolUse matchers == {"Skill", "Bash"};
+      assert "SessionEnd" in events. Run test_hooks_session_bind.py, test_plugin_hooks.py,
+      then the whole unit suite (the Hermes hooks-sync tripwire enumerates Claude hooks —
+      if it fails, add the two new scripts to the list it checks against, with a note that
+      Hermes wiring is a follow-up). Commit:
+      `feat(hooks): bind/unbind Claude sessions to fr workspaces (PostToolUse Bash, SessionEnd)`.
+state:
+  steps:
+    P3.T1.S1:
+      state: x
+      ticked_at: '2026-09-05T20:44:27+00:00'
+      note: null
+    P3.T2.S1:
+      state: x
+      ticked_at: '2026-09-05T20:45:08+00:00'
+      note: null
+    P3.T2.S2:
+      state: x
+      ticked_at: '2026-09-05T20:47:52+00:00'
+      note: null
+  completion:
+    at: '2026-09-05T20:48:47+00:00'
+    note: null
+    observed_prs: []

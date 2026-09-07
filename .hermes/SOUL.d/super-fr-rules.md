@@ -81,6 +81,14 @@ Claude Code (e.g. `Read(./.ssh/**)`, `Bash(cat ~/.ssh/*)`), or the equivalent in
 your harness. fr ships no such rules and should not: it has no idea what is
 sensitive on your machine.
 
+**Session bindings are traceability, not enforcement.** `fr isolation attach`
+and `up --session` record which harness session holds a workspace (in the
+workspace state plus `~/.cache/fr/sessions/<session-id>.json`) so that `status`
+and the status line can answer "where is this session's work?". The edit gate
+above never consults a binding: it reads the `.fr-isolation` marker only, so an
+unbound session inside a valid workspace edits freely and a bound session in the
+base clone is still denied. A missing or stale binding changes nothing here.
+
 ## Three isolation modes
 
 The marker's `mode` records who owns the environment; the edit-gate only cares
@@ -191,6 +199,24 @@ remains for non-fr repos and quick non-isolated checks.
 ## fr-* Skill Overview
 
 For a condensed overview of the fr-* skills and their CLI subcommands, run `fr skills`.
+
+# Worktree Skill Override (fr-enabled repos)
+
+In a repo with fr plans (`docs/superpowers/plans/`) or devcontainer profiles
+(`.devcontainer/<profile>/`), any skill or instruction that would invoke
+`superpowers:using-git-worktrees` — "work in a worktree", "isolate this",
+executing-plans' isolation step — invokes `fr-isolation` instead:
+
+    fr isolation up --branch <feat/slug>
+
+Never create `<repo>/.worktrees/`. fr owns the location
+(`~/.cache/fr/worktrees/<main-checkout>/<branch-slug>`), the state, and the
+session binding (`fr isolation status` shows which sessions hold a workspace).
+
+`claude --worktree <name>` and the `EnterWorktree` tool need no override:
+super-fr's `WorktreeCreate` hook already lands them in fr (subagent worktrees,
+`agent-*`, keep Claude's default shape on purpose). Plain
+`using-git-worktrees` remains for non-fr repos.
 
 # Never `claude -p` for batch LLM work (Org-Wide)
 

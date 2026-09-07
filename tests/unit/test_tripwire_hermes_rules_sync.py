@@ -1,9 +1,9 @@
 """CI tripwire: .hermes/SOUL.d/super-fr-rules.md must mirror the shipped rules.
 
 Hermes has no OpenCode-style `instructions` array; its only always-on global
-surface is `~/.hermes/SOUL.md`. `scripts/sync-hermes.py` assembles the three
+surface is `~/.hermes/SOUL.md`. `scripts/sync-hermes.py` assembles the four
 *shipped* plugin rules (fr-isolation-required, fr-plan-override,
-no-claude-p-batch) into a delimited managed block written to
+fr-worktree-override, no-claude-p-batch) into a delimited managed block written to
 `.hermes/SOUL.d/super-fr-rules.md`; `fr hermes install` later applies that block
 to the user's `~/.hermes/SOUL.md`. The repo-local `acceptance-matrix` rule is a
 super-fr-repo-maintainer rule (no plugin equivalent) and is deliberately NOT
@@ -27,10 +27,15 @@ assert _spec is not None and _spec.loader is not None
 sync_hermes = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sync_hermes)
 
-SHIPPED_RULES = {"fr-isolation-required", "fr-plan-override", "no-claude-p-batch"}
+SHIPPED_RULES = {
+    "fr-isolation-required",
+    "fr-plan-override",
+    "fr-worktree-override",
+    "no-claude-p-batch",
+}
 
 
-def test_canonical_rules_are_exactly_the_three_shipped_rules() -> None:
+def test_canonical_rules_are_exactly_the_shipped_rules() -> None:
     names = set(sync_hermes.canonical_rules())
     assert names == SHIPPED_RULES, (
         f"expected exactly {sorted(SHIPPED_RULES)}, got {sorted(names)} — "

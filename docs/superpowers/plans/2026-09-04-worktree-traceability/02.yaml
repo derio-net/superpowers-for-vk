@@ -1,0 +1,139 @@
+schema_version: 2
+phase:
+  number: 2
+  title: Repo key via git common dir + gc hygiene (empty-repo-dir, stale-session)
+  tag: agentic
+  depends_on:
+  - 1
+  tracking_issue: null
+  acceptance:
+  - nested-up-files-under-main-checkout
+  - gc-reaps-empty-repo-dirs
+tasks:
+- number: 1
+  title: RED — repo_cache_name and nested up
+  steps:
+  - id: P2.T1.S1
+    text: |
+      RED: create tests/unit/test_isolation_repo_key.py. Build a git repo
+      `main_repo` (tmp_path/"acme", one commit), a linked worktree
+      `tmp_path/"acme"/.claude/worktrees/agent-abc` via
+      `git -C acme worktree add --detach <that path> HEAD`, and a second
+      linked worktree at tmp_path/"elsewhere"/"feat__nested".
+      Assert `fr.isolation.types.repo_cache_name(p) == "acme"` for all three
+      paths (main checkout, `.claude/worktrees/agent-abc`, `feat__nested`).
+      Then with HOME monkeypatched to tmp_path/"home" and
+      FR_ISOLATION_TARGET=worktree, instantiate
+      `HostWorktreeTarget(<agent-abc path>, runner=<fake run that delegates git
+      to subprocess, returns "" otherwise>, gc_spawner=lambda _r: None)` and call
+      `.up(profile=None, branch="feat/from-inside", base="HEAD")`;
+      assert the returned `state.worktree ==
+      tmp_path/"home"/".cache"/"fr"/"worktrees"/"acme"/"feat__from-inside"`
+      (today it lands under "agent-abc"). Run, confirm both failures.
+- number: 2
+  title: GREEN — repo_cache_name + _worktree_up_core
+  steps:
+  - id: P2.T2.S1
+    text: |
+      GREEN: in packages/fr/src/fr/isolation/types.py add
+
+      def repo_cache_name(repo_root: Path) -> str:
+          """Folder under ~/.cache/fr/worktrees for this repo: the MAIN checkout's
+          basename, resolved through the git common dir, so `up` from inside a
+          linked worktree (native agent worktree, nested fr worktree) files under the
+          repo — never under `agent-…` or a branch slug (spec 2026-09-04 §5.C)."""
+          common = _git_common_dir(repo_root)
+          return common.parent.name if common.name == ".git" else repo_root.name
+
+      In packages/fr/src/fr/isolation/local.py `_worktree_up_core`, replace
+      `/ self.repo_root.name` with `/ repo_cache_name(self.repo_root)` (import it).
+      Also update the `--path` help text in isolation_cmd.py `up` to
+      "Worktree path (default: ~/.cache/fr/worktrees/<main-checkout>/<branch>)."
+      Run the Task 1 tests + tests/unit/test_isolation.py + test_isolation_hostworktree.py, confirm green.
+- number: 3
+  title: RED — gc verdicts empty-repo-dir and stale-session
+  steps:
+  - id: P2.T3.S1
+    text: |
+      RED: create tests/unit/test_isolation_gc_hygiene.py. HOME → tmp_path/"home",
+      FR_SESSIONS_DIR → tmp_path/"home"/".cache"/"fr"/"sessions",
+      FR_ISOLATION_TARGET=worktree, a git repo `repo` with one commit, a
+      `HostWorktreeTarget(repo, runner=<fake: git real, gh → "">, gc_spawner=lambda _r: None)`.
+      (a) mkdir `home/.cache/fr/worktrees/agent-deadbeef` (empty) and
+      `home/.cache/fr/worktrees/repo/feat__live` (non-empty, containing a file);
+      `target.gc(dry_run=True)` includes `GcAction(worktree=<agent-deadbeef path>,
+      branch=None, verdict="empty-repo-dir", action="would-remove")` and no such
+      action for `repo`; `gc(dry_run=False)` removes the empty dir, leaves `repo/`.
+      (b) write a session index via `sessions.attach` for a saved state whose
+      worktree dir exists, then rmtree the worktree dir; `gc(dry_run=True)` yields
+      `GcAction(worktree=<wt>, branch="feat/x", verdict="stale-session",
+      action="would-remove", detail=<index path>)`; `gc()` unlinks the index.
+      A healthy index is untouched. Run, confirm failures (verdicts unknown).
+- number: 4
+  title: GREEN — gc sweeps
+  steps:
+  - id: P2.T4.S1
+    text: |
+      GREEN (local.py): add to LocalWorktreeDevcontainerTarget
+
+      def _empty_repo_dirs(self) -> list[Path]:
+          root = _home() / ".cache" / "fr" / "worktrees"
+          if not root.is_dir():
+              return []
+          return [d for d in sorted(root.iterdir()) if d.is_dir() and not any(c.is_dir() for c in d.iterdir())]
+
+      def _sweep_empty_repo_dirs(self, dry_run: bool) -> list[GcAction]:
+          out: list[GcAction] = []
+          for d in self._empty_repo_dirs():
+              if dry_run:
+                  out.append(GcAction(str(d), None, "empty-repo-dir", "would-remove"))
+                  continue
+              try:
+                  shutil.rmtree(d)
+                  out.append(GcAction(str(d), None, "empty-repo-dir", "removed"))
+              except OSError as e:
+                  out.append(GcAction(str(d), None, "empty-repo-dir", "reap-failed", str(e)))
+          return out
+
+      def _sweep_stale_sessions(self, dry_run: bool) -> list[GcAction]:
+          from .sessions import stale_session_indexes
+          out: list[GcAction] = []
+          for p, data in stale_session_indexes():
+              wt, br = data.get("worktree", "?"), data.get("branch")
+              if dry_run:
+                  out.append(GcAction(wt, br, "stale-session", "would-remove", str(p)))
+                  continue
+              p.unlink(missing_ok=True)
+              out.append(GcAction(wt, br, "stale-session", "removed", str(p)))
+          return out
+
+      and in `gc()` after `_sweep_dangling_images`:
+      `actions.extend(self._sweep_empty_repo_dirs(dry_run)); actions.extend(self._sweep_stale_sessions(dry_run))`.
+      Update the GcAction.verdict comment to list the two new verdicts. Check
+      `fr isolation gc`'s text printer in isolation_cmd.py prints unknown verdicts
+      generically (it formats `verdict/action`); if it switches on verdict, add the two.
+      Run Task 3 tests + tests/unit/test_isolation.py (gc cases), confirm green. Run the
+      whole unit suite. Commit:
+      `fix(isolation): key the fr cache on the main checkout; gc reaps empty repo dirs and stale session indexes`.
+state:
+  steps:
+    P2.T1.S1:
+      state: x
+      ticked_at: '2026-09-05T20:33:25+00:00'
+      note: null
+    P2.T2.S1:
+      state: x
+      ticked_at: '2026-09-05T20:35:30+00:00'
+      note: null
+    P2.T3.S1:
+      state: x
+      ticked_at: '2026-09-05T20:36:19+00:00'
+      note: null
+    P2.T4.S1:
+      state: x
+      ticked_at: '2026-09-05T20:39:32+00:00'
+      note: null
+  completion:
+    at: '2026-09-05T20:39:33+00:00'
+    note: null
+    observed_prs: []

@@ -12,6 +12,7 @@ import errno
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -29,6 +30,7 @@ from fr.isolation.types import (
     delete_state,
     harden_secret_file,
     list_states,
+    repo_cache_name,
     resolve_profile,
     save_state,
 )
@@ -119,8 +121,11 @@ class GcAction:
 
     worktree: str
     branch: str | None
-    verdict: str  # merged | merged-by-content | open | no-pr | orphan | no-state
-    action: str  # reaped | skipped | warned | reap-failed | would-reap
+    # merged | merged-by-content | open | no-pr | orphan | no-state | dangling-image
+    # | empty-repo-dir | stale-session (cache/index hygiene, spec 2026-09-04 §5)
+    verdict: str
+    # reaped | skipped | warned | reap-failed | would-reap | removed | would-remove
+    action: str
     detail: str = ""
 
 
@@ -273,12 +278,14 @@ class LocalWorktreeDevcontainerTarget:
             raise IsolationError(
                 f"{self.repo_root} is not a git repo — fr isolation only runs inside one."
             )
+        # Keyed on the MAIN checkout's basename (spec 2026-09-04 §5.C): an `up`
+        # from inside a linked worktree files under the repo, never `agent-…`.
         worktree = path or (
             _home()
             / ".cache"
             / "fr"
             / "worktrees"
-            / self.repo_root.name
+            / repo_cache_name(self.repo_root)
             / branch.replace("/", "__")
         )
         worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -641,6 +648,8 @@ class LocalWorktreeDevcontainerTarget:
         try:
             actions = [self._gc_one(rec, dry_run) for rec in self._discover_workspaces()]
             actions.extend(self._sweep_dangling_images(dry_run))
+            actions.extend(self._sweep_empty_repo_dirs(dry_run))
+            actions.extend(self._sweep_stale_sessions(dry_run))
             return actions
         finally:
             lock.close()
@@ -954,6 +963,56 @@ class LocalWorktreeDevcontainerTarget:
     def _referenced_images(self) -> set[str]:
         result = self.run(["docker", "ps", "-a", "--format", "{{.Image}}"])
         return {ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()}
+
+    # ---------- gc: cache + session-index hygiene (spec 2026-09-04 §5.A/§5.C) ----------
+    #
+    # Substrate-neutral (no docker, no git), so every worktree mode inherits
+    # them verbatim; ExternalTarget has its own read-only gc and is untouched.
+
+    def _empty_repo_dirs(self) -> list[Path]:
+        """Children of `~/.cache/fr/worktrees` with NO subdirectories — the
+        `agent-…` / branch-slug folders an `up` from inside a linked worktree
+        used to create before the cache was keyed on the main checkout, plus any
+        repo folder whose last workspace was torn down. Stray files (`.DS_Store`)
+        do not make a folder live: a workspace is always a subdirectory."""
+        root = _home() / ".cache" / "fr" / "worktrees"
+        if not root.is_dir():
+            return []
+        return [
+            d
+            for d in sorted(root.iterdir())
+            if d.is_dir() and not any(c.is_dir() for c in d.iterdir())
+        ]
+
+    def _sweep_empty_repo_dirs(self, dry_run: bool) -> list[GcAction]:
+        out: list[GcAction] = []
+        for d in self._empty_repo_dirs():
+            if dry_run:
+                out.append(GcAction(str(d), None, "empty-repo-dir", "would-remove"))
+                continue
+            try:
+                shutil.rmtree(d)
+                out.append(GcAction(str(d), None, "empty-repo-dir", "removed"))
+            except OSError as e:  # per-dir; never abort the host-wide sweep
+                out.append(GcAction(str(d), None, "empty-repo-dir", "reap-failed", str(e)))
+        return out
+
+    def _sweep_stale_sessions(self, dry_run: bool) -> list[GcAction]:
+        """Unlink per-session index files whose worktree is gone or whose
+        workspace state no longer lists the session (state wins — the index is
+        derived). Classification lives in `sessions.stale_session_indexes`, which
+        is pure; only the unlink happens here. `detail` carries the index path."""
+        from .sessions import stale_session_indexes
+
+        out: list[GcAction] = []
+        for p, data in stale_session_indexes():
+            wt, br = data.get("worktree", "?"), data.get("branch")
+            if dry_run:
+                out.append(GcAction(wt, br, "stale-session", "would-remove", str(p)))
+                continue
+            p.unlink(missing_ok=True)
+            out.append(GcAction(wt, br, "stale-session", "removed", str(p)))
+        return out
 
     # ---------- helpers ----------
 

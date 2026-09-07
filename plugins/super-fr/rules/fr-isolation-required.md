@@ -79,6 +79,14 @@ Claude Code (e.g. `Read(./.ssh/**)`, `Bash(cat ~/.ssh/*)`), or the equivalent in
 your harness. fr ships no such rules and should not: it has no idea what is
 sensitive on your machine.
 
+**Session bindings are traceability, not enforcement.** `fr isolation attach`
+and `up --session` record which harness session holds a workspace (in the
+workspace state plus `~/.cache/fr/sessions/<session-id>.json`) so that `status`
+and the status line can answer "where is this session's work?". The edit gate
+above never consults a binding: it reads the `.fr-isolation` marker only, so an
+unbound session inside a valid workspace edits freely and a bound session in the
+base clone is still denied. A missing or stale binding changes nothing here.
+
 ## Three isolation modes
 
 The marker's `mode` records who owns the environment; the edit-gate only cares

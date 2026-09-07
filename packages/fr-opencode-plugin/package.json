@@ -1,6 +1,6 @@
 {
   "name": "@derio-net/fr-opencode-plugin",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "description": "OpenCode plugin: block edits to tracked source in an fr-enabled repo unless inside an fr-isolation workspace. Ports plugins/super-fr/hooks/fr-isolation-required.sh (Claude Code) to OpenCode's tool.execute.before hook.",
   "type": "module",
   "main": "src/index.ts",

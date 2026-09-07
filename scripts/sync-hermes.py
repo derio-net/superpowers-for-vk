@@ -42,7 +42,12 @@ RULES_CANONICAL_DIR = REPO_ROOT / "plugins" / "super-fr" / "rules"
 # exactly the set install.sh copies to ~/.claude/rules/ for Claude Code. The
 # repo-local acceptance-matrix rule (no plugin equivalent) is maintainer-only
 # and must never ship into a consumer's SOUL.md.
-SHIPPED_RULE_NAMES = ("fr-isolation-required", "fr-plan-override", "no-claude-p-batch")
+SHIPPED_RULE_NAMES = (
+    "fr-isolation-required",
+    "fr-plan-override",
+    "fr-worktree-override",
+    "no-claude-p-batch",
+)
 SOUL_D_MIRROR = REPO_ROOT / ".hermes" / "SOUL.d" / "super-fr-rules.md"
 SOUL_BLOCK_START = "<!-- super-fr:rules START -->"
 SOUL_BLOCK_END = "<!-- super-fr:rules END -->"

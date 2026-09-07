@@ -1,0 +1,333 @@
+schema_version: 2
+phase:
+  number: 1
+  title: 'Engine — session bindings: SessionBinding, per-session index, attach/detach
+    verbs, status/up/down integration'
+  tag: agentic
+  depends_on: []
+  tracking_issue: null
+  acceptance:
+  - session-workspace-binding
+tasks:
+- number: 1
+  title: RED — state model + fr.isolation.sessions library
+  steps:
+  - id: P1.T1.S1
+    text: |
+      RED: create tests/unit/test_isolation_sessions.py. Fixtures: `home`
+      (monkeypatch HOME to tmp_path/"home", set FR_SESSIONS_DIR to
+      tmp_path/"sessions"), `repo` (git init -q -b main tmp_path/"repo",
+      one commit), and `workspace(repo, branch)` helper that mkdirs
+      tmp_path/"wt"/<slug> and calls
+      `save_state(IsolationState(repo_root=repo, branch=branch,
+      worktree=<that dir>, profile="host", created_at="2026-09-05T00:00:00+00:00"))`.
+      Cases:
+      (a) `IsolationState.model_validate_json` of a JSON WITHOUT a
+      `sessions` key (the pre-feature file shape) loads with `sessions == []`;
+      (b) `sessions.attach(repo, "feat/x", "sess-1", harness="claude")`
+      returns a state whose `sessions` has one `SessionBinding` with
+      `session_id == "sess-1"`, `harness == "claude"`, an ISO `attached_at`;
+      `load_state(repo, "feat/x").sessions` matches; and
+      `sessions.read_session_index("sess-1")` == {"session_id": "sess-1",
+      "harness": "claude", "repo_root": str(repo), "branch": "feat/x",
+      "worktree": str(<wt>), "profile": "host", "attached_at": <same>};
+      (c) attach is idempotent — a second attach of sess-1 to feat/x
+      leaves exactly one binding (attached_at refreshed);
+      (d) single binding per session — attach sess-1 to feat/y after
+      feat/x removes it from feat/x's state and the index now says feat/y;
+      (e) `sessions.detach("sess-1")` returns ["feat/y"], the state has no
+      binding and the index file is gone; detaching again returns [] and
+      exits cleanly (idempotent);
+      (f) `sessions.detach_all(state)` for a workspace with sess-1 and
+      sess-2 returns both ids and removes both index files;
+      (g) `sessions.stale_session_indexes()` lists (path, data) for an
+      index whose `worktree` dir was rmtree'd, and for an index whose
+      session is no longer in the state's `sessions`, but NOT for a
+      healthy one;
+      (h) `session_index_path("../x")` and `session_index_path("")` raise
+      IsolationError.
+      Run `uv run pytest -q --no-cov tests/unit/test_isolation_sessions.py`,
+      confirm it fails on import (fr.isolation.sessions does not exist).
+- number: 2
+  title: GREEN — SessionBinding on IsolationState + sessions.py
+  steps:
+  - id: P1.T2.S1
+    text: |
+      GREEN (types.py): in packages/fr/src/fr/isolation/types.py add,
+      above IsolationState:
+
+      class SessionBinding(BaseModel):
+          """One agent session attached to a workspace (spec 2026-09-04 §5.A)."""
+          session_id: str
+          harness: str = "unknown"   # claude | hermes | opencode | unknown
+          attached_at: str           # ISO-8601 UTC
+          model_config = {"frozen": True}
+
+      and on IsolationState add the field
+      `sessions: list[SessionBinding] = Field(default_factory=list)`
+      (import Field from pydantic). Frozen models still support
+      `model_copy(update=...)`, which is how sessions.py rewrites them.
+      Old state files without the key keep loading (case a).
+  - id: P1.T2.S2
+    text: |
+      GREEN (sessions.py): create packages/fr/src/fr/isolation/sessions.py:
+
+      """Session <-> workspace bindings — traceability (spec 2026-09-04 §5.A).
+
+      State (IsolationState.sessions, per repo in the git common dir) is the
+      source of truth. ~/.cache/fr/sessions/<session_id>.json is an INDEX so a
+      status line answers "which workspace is this session in" from one small
+      file. The pipeline sentinel dir is untouched: its PRESENCE arms the Bash
+      guard, so bindings must not live there (decision d1 refinement).
+      """
+      from __future__ import annotations
+      import json, os
+      from datetime import UTC, datetime
+      from pathlib import Path
+      from .types import (IsolationError, IsolationState, SessionBinding, _home,
+                          list_states, load_state, save_state)
+
+      def sessions_dir() -> Path:
+          return Path(os.environ.get("FR_SESSIONS_DIR", str(_home() / ".cache" / "fr" / "sessions")))
+
+      def session_index_path(session_id: str) -> Path:
+          if not session_id or "/" in session_id or session_id in (".", ".."):
+              raise IsolationError(f"invalid session id {session_id!r}")
+          return sessions_dir() / f"{session_id}.json"
+
+      def read_session_index(session_id: str) -> dict | None:
+          p = session_index_path(session_id)
+          if not p.is_file():
+              return None
+          try:
+              return json.loads(p.read_text())
+          except json.JSONDecodeError:
+              return None
+
+      def _write_index(state: IsolationState, b: SessionBinding) -> Path:
+          p = session_index_path(b.session_id)
+          p.parent.mkdir(parents=True, exist_ok=True)
+          p.write_text(json.dumps({
+              "session_id": b.session_id, "harness": b.harness,
+              "repo_root": str(state.repo_root), "branch": state.branch,
+              "worktree": str(state.worktree), "profile": state.profile,
+              "attached_at": b.attached_at}, indent=2) + "\n")
+          return p
+
+      def _without(state: IsolationState, session_id: str) -> IsolationState:
+          return state.model_copy(update={"sessions": [b for b in state.sessions if b.session_id != session_id]})
+
+      def _drop_binding(repo_root: Path, branch: str, session_id: str) -> bool:
+          state = load_state(repo_root, branch)
+          if state is None or all(b.session_id != session_id for b in state.sessions):
+              return False
+          save_state(_without(state, session_id))
+          return True
+
+      def attach(repo_root: Path, branch: str, session_id: str, harness: str = "unknown") -> IsolationState:
+          """Bind `session_id` to the workspace (idempotent). A session holds at most ONE
+          binding: any previous one — in this repo or, via the index, another — is dropped."""
+          state = load_state(repo_root, branch)
+          if state is None:
+              raise IsolationError(f"no isolation workspace for branch {branch!r} — run `fr isolation up` first.")
+          prev = read_session_index(session_id)
+          if prev and (Path(prev.get("repo_root", "")) != repo_root or prev.get("branch") != branch):
+              _drop_binding(Path(prev["repo_root"]), prev["branch"], session_id)
+          for other in list_states(repo_root):
+              if other.branch != branch:
+                  _drop_binding(repo_root, other.branch, session_id)
+          b = SessionBinding(session_id=session_id, harness=harness, attached_at=datetime.now(UTC).isoformat())
+          base = _without(state, session_id)
+          new = base.model_copy(update={"sessions": [*base.sessions, b]})
+          save_state(new)
+          _write_index(new, b)
+          return new
+
+      def detach(session_id: str, repo_root: Path | None = None, branch: str | None = None) -> list[str]:
+          """Unbind the session wherever it is bound (index + optional explicit target).
+          Returns the branches it was detached from; [] when it held no binding."""
+          targets: list[tuple[Path, str]] = []
+          idx = read_session_index(session_id)
+          if idx and idx.get("repo_root") and idx.get("branch"):
+              targets.append((Path(idx["repo_root"]), idx["branch"]))
+          if repo_root is not None:
+              branches = [branch] if branch else [s.branch for s in list_states(repo_root)]
+              targets.extend((repo_root, b) for b in branches)
+          detached: list[str] = []
+          for r, b in dict.fromkeys(targets):
+              if _drop_binding(r, b, session_id):
+                  detached.append(b)
+          session_index_path(session_id).unlink(missing_ok=True)
+          return detached
+
+      def detach_all(state: IsolationState) -> list[str]:
+          """`down`: unbind every session of this workspace and drop their index files."""
+          ids = [b.session_id for b in state.sessions]
+          for sid in ids:
+              idx = read_session_index(sid)
+              if idx and idx.get("branch") == state.branch and Path(idx.get("repo_root", "")) == state.repo_root:
+                  session_index_path(sid).unlink(missing_ok=True)
+          if ids:
+              save_state(state.model_copy(update={"sessions": []}))
+          return ids
+
+      def stale_session_indexes() -> list[tuple[Path, dict]]:
+          """Index files whose worktree is gone, whose state no longer lists the
+          session, or which do not parse. Pure — gc decides what to do."""
+          d = sessions_dir()
+          if not d.is_dir():
+              return []
+          stale: list[tuple[Path, dict]] = []
+          for p in sorted(d.glob("*.json")):
+              try:
+                  data = json.loads(p.read_text())
+              except json.JSONDecodeError:
+                  stale.append((p, {}))
+                  continue
+              wt = Path(data.get("worktree", ""))
+              state = load_state(Path(data["repo_root"]), data["branch"]) if data.get("repo_root") and data.get("branch") else None
+              listed = state is not None and any(b.session_id == data.get("session_id") for b in state.sessions)
+              if not wt.is_dir() or not listed:
+                  stale.append((p, data))
+          return stale
+
+      Run the Task 1 tests, confirm green. `git add packages/fr/src/fr/isolation/types.py
+      packages/fr/src/fr/isolation/sessions.py tests/unit/test_isolation_sessions.py`.
+- number: 3
+  title: 'RED — CLI: attach, detach, status sessions, up --session, down unbinds'
+  steps:
+  - id: P1.T3.S1
+    text: |
+      RED: create tests/unit/test_isolation_sessions_cmd.py using
+      `typer.testing.CliRunner` on `fr.cli.app`. Copy the `repo`, `fake_run`,
+      `_no_real_gc_spawn` and `_default_mode` fixtures from
+      tests/unit/test_isolation_cmd.py (do not import them across files —
+      the existing file keeps its own), set FR_SESSIONS_DIR to tmp_path/"sessions",
+      and for `up` tests set FR_ISOLATION_TARGET=worktree (host-worktree
+      mode: no docker). Cases:
+      (a) `fr isolation attach --session s1 --repo <repo> --branch feat/x`
+      after a `save_state(...)` for feat/x → exit 0, stdout contains
+      "attached s1 -> feat/x", index file exists;
+      (b) attach with --branch omitted and TWO workspaces → exit 2, stderr
+      "multiple isolation workspaces — specify --branch"; with exactly one
+      workspace → binds it;
+      (c) attach for a branch with no state → exit 2 "no isolation workspace";
+      (d) `fr isolation detach --session s1` → exit 0, stdout
+      "detached s1 <- feat/x"; again → exit 0, stdout "detached s1 (no binding)";
+      (e) `fr isolation status --format json` (FR_ISOLATION_TARGET=worktree,
+      fake_run) → each row has `sessions: [{session_id, harness, attached_at}]`;
+      text output line ends with ` sessions=s1` (or `sessions=none`);
+      `status --session s1` lists only s1's workspace;
+      (f) `fr isolation up --branch feat/z --session s9 --harness claude`
+      (host mode) → exit 0, `load_state(repo, "feat/z").sessions[0].session_id == "s9"`,
+      index file for s9 exists;
+      (g) `fr isolation down --branch feat/z` with s9 bound and the
+      workspace having no PR (fake_run returns "" for gh) → exit 0, stderr
+      contains "warning: sessions still attached: s9", index file for s9 removed.
+      Run the file, confirm failures (commands/options do not exist).
+- number: 4
+  title: GREEN — wire the CLI
+  steps:
+  - id: P1.T4.S1
+    text: |
+      GREEN (isolation_cmd.py): in packages/fr/src/fr/commands/isolation_cmd.py
+      `from fr.isolation import sessions as _sessions`. Add a shared resolver
+      (mirrors exec's no-branch handling):
+
+      def _resolve_single(root: Path, branch: str | None) -> IsolationState:
+          if branch is not None:
+              state = load_state(root, branch)
+          else:
+              states = list_states(root)
+              if len(states) > 1:
+                  _fail(IsolationError("multiple isolation workspaces — specify --branch: " + ", ".join(s.branch for s in states)))
+              state = states[0] if states else None
+          if state is None:
+              _fail(IsolationError(f"no isolation workspace for branch {branch!r} — run `fr isolation up` first." if branch else "no isolation workspace — run `fr isolation up` first."))
+          return state  # type: ignore[return-value]
+
+      Then add the two commands:
+
+      @isolation_app.command()
+      def attach(
+          session: str = typer.Option(..., "--session", help="Agent session id (from the harness hook payload)."),
+          repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+          branch: str | None = typer.Option(None, help="Isolation branch (default: the single active workspace)."),
+          harness: str = typer.Option("unknown", help="claude | hermes | opencode | unknown"),
+      ) -> None:
+          """Bind a session to a workspace (traceability; idempotent)."""
+          root = _resolve_repo(repo)
+          state = _resolve_single(root, branch)
+          try:
+              _sessions.attach(root, state.branch, session, harness=harness)
+          except IsolationError as err:
+              _fail(err)
+              return
+          typer.echo(f"attached {session} -> {state.branch}")
+
+      @isolation_app.command()
+      def detach(
+          session: str = typer.Option(..., "--session"),
+          repo: Path | None = typer.Option(None, help="Limit to this repo (default: wherever the session is bound)."),
+          branch: str | None = typer.Option(None),
+      ) -> None:
+          """Unbind a session (idempotent; exit 0 when nothing was bound)."""
+          try:
+              gone = _sessions.detach(session, repo_root=repo.resolve() if repo else None, branch=branch)
+          except IsolationError as err:
+              _fail(err)
+              return
+          typer.echo(f"detached {session} <- {', '.join(gone)}" if gone else f"detached {session} (no binding)")
+
+      Refactor `exec` and `down` to call `_resolve_single` instead of their
+      inline copies (behaviour identical; tests in test_isolation_cmd.py stay green).
+  - id: P1.T4.S2
+    text: |
+      GREEN (status / up / down): in `status` add
+      `session: str | None = typer.Option(None, "--session", help="Only the workspace this session is bound to.")`;
+      after computing `states`, `if session: states = [s for s in states if any(b.session_id == session for b in s.sessions)]`;
+      after `rows = [...]`, `for row, s in zip(rows, states): row["sessions"] = [b.model_dump() for b in s.sessions]`;
+      in the text line append `f" sessions={','.join(b.session_id for b in s.sessions) or 'none'}"`
+      (zip rows with states in the print loop).
+      In `up` add `session: str | None = typer.Option(None, "--session")` and
+      `harness: str = typer.Option("unknown", "--harness")`; after the
+      target's `up` returns: `if session: state = _sessions.attach(state.repo_root, state.branch, session, harness=harness)`
+      (wrap in the same try/_fail).
+      In `down` (single-workspace path) add `session: str | None = typer.Option(None, "--session", help="The calling session; excluded from the still-attached warning.")`;
+      before `_target(root).down(state, force=force)`:
+      `others = [b.session_id for b in state.sessions if b.session_id != session]`;
+      `if others: typer.echo(f"warning: sessions still attached: {', '.join(others)} — they will be detached", err=True)`;
+      `_sessions.detach_all(state)`. Do the same detach_all inside `_down_all`'s per-workspace loop.
+      Run tests/unit/test_isolation_sessions_cmd.py and tests/unit/test_isolation_cmd.py, confirm green.
+      Run `uv run pytest -q --no-cov tests/unit` for the whole package. Commit:
+      `feat(isolation): session bindings — attach/detach verbs, per-session index, status/up/down wiring`.
+state:
+  steps:
+    P1.T1.S1:
+      state: x
+      ticked_at: '2026-09-05T20:18:28+00:00'
+      note: null
+    P1.T2.S1:
+      state: x
+      ticked_at: '2026-09-05T20:19:32+00:00'
+      note: null
+    P1.T2.S2:
+      state: x
+      ticked_at: '2026-09-05T20:19:33+00:00'
+      note: null
+    P1.T3.S1:
+      state: x
+      ticked_at: '2026-09-05T20:21:01+00:00'
+      note: null
+    P1.T4.S1:
+      state: x
+      ticked_at: '2026-09-05T20:25:28+00:00'
+      note: null
+    P1.T4.S2:
+      state: x
+      ticked_at: '2026-09-05T20:25:29+00:00'
+      note: null
+  completion:
+    at: '2026-09-05T20:25:29+00:00'
+    note: null
+    observed_prs: []

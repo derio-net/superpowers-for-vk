@@ -156,7 +156,7 @@ toml = [
 
 [[package]]
 name = "fr"
-version = "4.0.0"
+version = "4.1.0"
 source = { editable = "packages/fr" }
 dependencies = [
     { name = "packaging" },
@@ -177,7 +177,7 @@ requires-dist = [
 
 [[package]]
 name = "fr-cncd"
-version = "4.0.0"
+version = "4.1.0"
 source = { editable = "packages/fr-cncd" }
 dependencies = [
     { name = "fr" },
@@ -192,7 +192,7 @@ requires-dist = [
 
 [[package]]
 name = "fr-dispatch"
-version = "4.0.0"
+version = "4.1.0"
 source = { editable = "packages/fr-dispatch" }
 dependencies = [
     { name = "fr" },
@@ -203,7 +203,7 @@ requires-dist = [{ name = "fr", editable = "packages/fr" }]
 
 [[package]]
 name = "fr-vk"
-version = "4.0.0"
+version = "4.1.0"
 source = { editable = "packages/fr-vk" }
 dependencies = [
     { name = "fr" },
@@ -665,7 +665,7 @@ wheels = [
 
 [[package]]
 name = "super-fr-workspace"
-version = "4.0.0"
+version = "4.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fr" },

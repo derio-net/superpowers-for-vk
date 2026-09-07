@@ -1,0 +1,124 @@
+schema_version: 2
+phase:
+  number: 5
+  title: Status-line segment — fr-statusline-segment.sh with golden tests
+  tag: agentic
+  depends_on:
+  - 1
+  tracking_issue: null
+  acceptance:
+  - statusline-shows-bound-workspace
+tasks:
+- number: 1
+  title: RED — golden tests for the three session shapes
+  steps:
+  - id: P5.T1.S1
+    text: |
+      RED: create tests/unit/test_statusline_segment.py (jq skip). Fixture builds, under
+      tmp_path/"home" (HOME monkeypatched), a repo `home/Docs/acme` (one commit, branch main),
+      two linked worktrees: `home/Docs/acme/.worktrees/blog` on branch `docs/blog`, and
+      `home/.cache/fr/worktrees/acme/feat__x` on branch `feat/x` — plus an fr state file for
+      feat/x via `save_state(...)` and, when the case needs it, a session index written with
+      `sessions.attach(repo, "feat/x", "sess-1", "claude")` (FR_SESSIONS_DIR = home/.cache/fr/sessions).
+      `run(payload)` = subprocess.run(["bash", SCRIPT], input=json.dumps(payload), env={..., "HOME": home, "FR_SESSIONS_DIR": ...}).
+      SCRIPT = REPO_ROOT/"plugins"/"super-fr"/"scripts"/"fr-statusline-segment.sh". Payload:
+      {"session_id": <sid>, "workspace": {"current_dir": <cwd>}, "cwd": <cwd>}.
+      Golden outputs (stdout is exactly two lines, second may be empty):
+      (a) bound, cwd = base clone:
+          line1 == "iso: <home>/.cache/fr/worktrees/acme/feat__x"
+          line2 == "worktrees (3): docs/blog:.worktrees/blog"   (bound and current excluded; total counts all)
+      (b) unbound (no index), cwd = base clone:
+          line1 == "iso: ? (feat/x)"
+          line2 == "worktrees (3): docs/blog:.worktrees/blog, feat/x:~/.cache/fr/worktrees/acme/feat__x"
+      (c) bound, cwd = the feat__x worktree itself:
+          line1 == ""    (cwd already is the workspace)
+          line2 == "worktrees (3): main:~/Docs/acme, docs/blog:~/Docs/acme/.worktrees/blog"
+          — paths outside the MAIN checkout are ~-relative; here cwd is outside it so even
+          .worktrees/blog is shown ~-relative (relative form is used only when the cwd's
+          main checkout contains the worktree AND cwd is inside that main checkout).
+      (d) cwd not a git repo → both lines empty, exit 0. (e) missing session_id → treated as unbound.
+      (f) a detached-HEAD worktree (add one with `git worktree add --detach`) is listed as `<7-char sha>:<rel>`.
+      Run, confirm failures (script missing).
+- number: 2
+  title: GREEN — the segment script
+  steps:
+  - id: P5.T2.S1
+    text: |
+      GREEN: create plugins/super-fr/scripts/fr-statusline-segment.sh (mkdir scripts/, chmod 755):
+
+      #!/bin/bash
+      # Status-line segment (spec 2026-09-04 §5.E). stdin: Claude Code status-line JSON.
+      # stdout: exactly two lines —
+      #   1  iso segment:     "iso: <bound worktree>" | "iso: ? (feat/x, feat/y)" | ""
+      #   2  worktree gauge:  "worktrees (N): b:rel, b2:rel[, +K more]" | ""
+      # Shell + jq + git only. NEVER the fr CLI (4 s). Budget < 60 ms.
+      set -u
+      data=$(cat)
+      session_id=$(printf '%s' "$data" | jq -r '.session_id // empty')
+      cwd=$(printf '%s' "$data" | jq -r '.workspace.current_dir // .cwd // empty')
+      sessions_dir="${FR_SESSIONS_DIR:-$HOME/.cache/fr/sessions}"
+      iso=""; gauge=""
+      toplevel=$(git -C "$cwd" --no-optional-locks rev-parse --show-toplevel 2>/dev/null || true)
+      if [ -z "$toplevel" ]; then printf '%s\n%s\n' "$iso" "$gauge"; exit 0; fi
+      common=$(git -C "$cwd" --no-optional-locks rev-parse --git-common-dir 2>/dev/null || true)
+      case "$common" in /*) ;; *) common="$toplevel/$common" ;; esac
+      common=$(cd "$common" 2>/dev/null && pwd -P)
+      main=$(dirname "$common")                       # main checkout: common dir is <main>/.git
+      bound=""
+      if [ -n "$session_id" ] && [ -f "$sessions_dir/$session_id.json" ]; then
+        bound=$(jq -r '.worktree // empty' "$sessions_dir/$session_id.json" 2>/dev/null || true)
+      fi
+      if [ -n "$bound" ]; then
+        [ "$bound" != "$toplevel" ] && iso="iso: $bound"
+      elif [ -d "$common/fr/isolation" ]; then
+        branches=$(jq -r '.branch' "$common"/fr/isolation/*.json 2>/dev/null | paste -sd, - | sed 's/,/, /g')
+        [ -n "$branches" ] && iso="iso: ? ($branches)"
+      fi
+      # --- gauge: every worktree except the cwd's own and the bound one ---
+      rel() {  # $1 = absolute worktree path
+        case "$toplevel/" in "$main"/*) case "$1" in "$main"/?*) printf '%s' "${1#"$main"/}"; return ;; esac ;; esac
+        case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac
+      }
+      entries=(); cur_path=""; cur_branch=""; cur_head=""
+      _flush() { [ -z "$cur_path" ] && return; b="$cur_branch"; [ -z "$b" ] && b="${cur_head:0:7}"; entries+=("${cur_path}|${b}"); cur_path=""; cur_branch=""; cur_head=""; }
+      while IFS= read -r line; do
+        case "$line" in
+          "worktree "*)          _flush; cur_path="${line#worktree }" ;;
+          "HEAD "*)              cur_head="${line#HEAD }" ;;
+          "branch refs/heads/"*) cur_branch="${line#branch refs/heads/}" ;;
+          bare)                  cur_branch="bare" ;;
+        esac
+      done < <(git -C "$toplevel" --no-optional-locks worktree list --porcelain 2>/dev/null)
+      _flush
+      total=${#entries[@]}
+      if [ "$total" -gt 1 ]; then
+        budget=${STATUSLINE_WT_WIDTH:-110}; plain=0; shown=0; list=""; others=()
+        for e in "${entries[@]}"; do p="${e%%|*}"; [ "$p" = "$toplevel" ] && continue; [ -n "$bound" ] && [ "$p" = "$bound" ] && continue; others+=("$e"); done
+        n=${#others[@]}
+        for e in "${others[@]}"; do
+          token="${e##*|}:$(rel "${e%%|*}")"; sep=0; [ "$shown" -gt 0 ] && sep=2
+          if [ "$shown" -gt 0 ] && [ $((plain + sep + ${#token})) -gt "$budget" ]; then list="$list, +$((n - shown)) more"; break; fi
+          [ "$shown" -gt 0 ] && list="$list, "; list="$list$token"; plain=$((plain + sep + ${#token})); shown=$((shown + 1))
+        done
+        [ "$n" -gt 0 ] && gauge="worktrees ($total): $list"
+      fi
+      printf '%s\n%s\n' "$iso" "$gauge"
+
+      Run Task 1 tests; adjust the golden strings only if the spec's format (§5.E) is preserved.
+      Add a coarse timing guard: the script must finish in < 0.5 s in CI (generous; the operator
+      budget is 60 ms on a warm Mac). Run the whole unit suite. Commit:
+      `feat(statusline): fr-statusline-segment.sh — bound workspace + worktree gauge from one file read`.
+state:
+  steps:
+    P5.T1.S1:
+      state: x
+      ticked_at: '2026-09-05T21:09:32+00:00'
+      note: null
+    P5.T2.S1:
+      state: x
+      ticked_at: '2026-09-05T21:16:48+00:00'
+      note: null
+  completion:
+    at: '2026-09-05T21:16:48+00:00'
+    note: null
+    observed_prs: []

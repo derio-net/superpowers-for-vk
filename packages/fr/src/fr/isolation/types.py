@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 def _warn_legacy(what: str, path: Path) -> None:
@@ -26,6 +26,16 @@ class IsolationError(Exception):
     """User-facing isolation failure; CLI maps it to exit 2."""
 
 
+class SessionBinding(BaseModel):
+    """One agent session attached to a workspace (spec 2026-09-04 §5.A)."""
+
+    session_id: str
+    harness: str = "unknown"  # claude | hermes | opencode | unknown
+    attached_at: str  # ISO-8601 UTC
+
+    model_config = {"frozen": True}
+
+
 class IsolationState(BaseModel):
     """Everything needed to re-address an isolation workspace later."""
 
@@ -34,6 +44,9 @@ class IsolationState(BaseModel):
     worktree: Path
     profile: str
     created_at: str
+    # Sessions bound to this workspace (spec 2026-09-04 §5.A). Default keeps
+    # pre-feature state files loadable; frozen models still `model_copy(update=)`.
+    sessions: list[SessionBinding] = Field(default_factory=list)
 
     model_config = {"frozen": True}
 
@@ -69,6 +82,18 @@ def _git_common_dir(repo_root: Path) -> Path:
         return repo_root / ".git"
     p = Path(out)
     return p if p.is_absolute() else (repo_root / p)
+
+
+def repo_cache_name(repo_root: Path) -> str:
+    """Folder under ~/.cache/fr/worktrees for this repo: the MAIN checkout's
+    basename, resolved through the git common dir, so `up` from inside a
+    linked worktree (native agent worktree, nested fr worktree) files under the
+    repo — never under `agent-…` or a branch slug (spec 2026-09-04 §5.C).
+
+    Bare / `--separate-git-dir` layouts (common dir not named ".git") and
+    non-git paths fall back to the basename of `repo_root` itself."""
+    common = _git_common_dir(repo_root)
+    return common.parent.name if common.name == ".git" else Path(repo_root).name
 
 
 def state_dir(repo_root: Path) -> Path:

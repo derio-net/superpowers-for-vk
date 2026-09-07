@@ -1,0 +1,69 @@
+schema_version: 2
+phase:
+  number: 7
+  title: '[manual] Operator rollout — install, patch the status line, one-time gc
+    sweep, verify claude --worktree'
+  tag: manual
+  depends_on:
+  - 6
+  tracking_issue: null
+  acceptance:
+  - statusline-shows-bound-workspace
+tasks:
+- number: 1
+  title: Install and wire the status line
+  steps:
+  - id: P7.T1.S1
+    text: |
+      After the PR merges and the plugin cache updates: run `bash scripts/install.sh` from
+      the super-fr main checkout; confirm `~/.claude/rules/fr-worktree-override.md` exists and
+      `jq '.hooks | keys' ~/.claude/plugins/cache/derio-net--super-fr/super-fr/current/hooks/hooks.json`
+      lists PostToolUse, PreToolUse, SessionEnd, SessionStart, WorktreeCreate, WorktreeRemove.
+  - id: P7.T1.S2
+    text: |
+      Patch ~/.claude/statusline.sh: delete its "Git worktrees (third line…)" block (lines
+      95–155 in the 2026-05-25 version) and the line-3 printer, and replace the line-2/3
+      output with the snippet from the fr-isolation SKILL.md. Test with mock input:
+        echo '{"session_id":"<this session id>","cwd":"/Users/derio/Docs/projects/DERIO_NET/super-fr","workspace":{"current_dir":"/Users/derio/Docs/projects/DERIO_NET/super-fr"},"model":{"display_name":"Fable"},"context_window":{"used_percentage":10}}' | bash ~/.claude/statusline.sh
+      Expected line 2: `main | ~/Docs/projects/DERIO_NET/super-fr | iso: ~/.cache/fr/worktrees/super-fr/feat__worktree-traceability`
+      (after `fr isolation attach --session <id> --branch feat/worktree-traceability --harness claude` once for this session).
+- number: 2
+  title: One-time hygiene + end-to-end check
+  steps:
+  - id: P7.T2.S1
+    text: |
+      `fr isolation gc --dry-run` from any fr repo: expect five `empty-repo-dir would-remove`
+      rows (agent-a9338827a0b031c06, agent-ac8817b7fc004a0f0, feat__bridge-reset-hard-sync,
+      test_adopt_does_not_create_a_s0, test_archive_moves_a_run_whose0). Then `fr isolation gc`.
+      `ls ~/.cache/fr/worktrees` shows only real repo folders.
+  - id: P7.T2.S2
+    text: |
+      In a second terminal: `cd ~/Docs/projects/DERIO_NET/super-fr && claude --worktree demo`.
+      Expect the session to start in `~/.cache/fr/worktrees/super-fr/wt__demo`;
+      `fr isolation status` in the first terminal shows `wt/demo … sessions=<new id>`; the
+      status line in the demo session shows line 2 with the worktree as cwd and no iso segment.
+      Exit the demo session choosing "remove": `fr isolation status` no longer lists wt/demo.
+      Flip the six matrix rows to `ci` (`fr acceptance` edits) as their tests land in CI, and
+      this row's evidence note to this check.
+state:
+  steps:
+    P7.T1.S1:
+      state: ' '
+      ticked_at: null
+      note: null
+    P7.T1.S2:
+      state: ' '
+      ticked_at: null
+      note: null
+    P7.T2.S1:
+      state: ' '
+      ticked_at: null
+      note: null
+    P7.T2.S2:
+      state: ' '
+      ticked_at: null
+      note: null
+  completion:
+    at: null
+    note: null
+    observed_prs: []

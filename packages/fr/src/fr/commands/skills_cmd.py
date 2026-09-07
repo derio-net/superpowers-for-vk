@@ -51,7 +51,7 @@ SKILLS: list[tuple[str, str, str]] = [
     (
         "fr-isolation",
         "Isolated workspace: worktree + devcontainer, exec-bridge (skill).",
-        "fr isolation {up,exec,status,down}",
+        "fr isolation {up,exec,status,attach,detach,down,gc}",
     ),
     (
         "fr-runner",

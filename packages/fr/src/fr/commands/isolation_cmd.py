@@ -14,6 +14,7 @@ from typing import Protocol, cast
 
 import typer
 
+from fr.isolation import sessions as _sessions
 from fr.isolation.external import ExternalTarget
 from fr.isolation.hostworktree import HostWorktreeTarget
 from fr.isolation.local import (
@@ -24,6 +25,7 @@ from fr.isolation.local import (
 )
 from fr.isolation.types import (
     IsolationError,
+    IsolationState,
     Target,
     clear_repo_sentinels,
     list_states,
@@ -129,6 +131,49 @@ def _target_or_exit(repo: Path) -> Target:
         raise typer.Exit(2) from err
 
 
+def _resolve_single(root: Path, branch: str | None) -> IsolationState:
+    """Resolve the workspace a command targets: explicit `--branch`, else the
+    single active workspace, else a clean exit 2 (super-fr#299 part 3 — never a
+    phantom hardcoded default). Shared by exec / restart / down / attach."""
+    if branch is not None:
+        state = load_state(root, branch)
+    else:
+        states = list_states(root)
+        if len(states) > 1:
+            _fail(
+                IsolationError(
+                    "multiple isolation workspaces — specify --branch: "
+                    + ", ".join(s.branch for s in states)
+                )
+            )
+        state = states[0] if states else None
+    if state is None:
+        _fail(
+            IsolationError(
+                f"no isolation workspace for branch {branch!r} — run `fr isolation up` first."
+                if branch
+                else "no isolation workspace — run `fr isolation up` first."
+            )
+        )
+    return state  # type: ignore[return-value]
+
+
+def _resolve_by_worktree(worktree: Path) -> IsolationState:
+    """Resolve a workspace by its worktree path (`down --worktree`, spec
+    2026-09-04 §5.B.4). `list_states` keys on the git common dir, which resolves
+    from inside the worktree; a non-git or missing path degrades to no states
+    (never a traceback) → clean exit 2."""
+    wt = worktree.resolve()
+    try:
+        states = list_states(wt) if wt.is_dir() else []
+    except IsolationError:
+        states = []
+    matches = [s for s in states if s.worktree.resolve() == wt]
+    if not matches:
+        _fail(IsolationError(f"no isolation workspace at {wt}"))
+    return matches[0]
+
+
 def _refuse_external(target: Target, op: str) -> None:
     """External mode adopts a preparer-managed containment — the worktree-ops
     subcommands (push-check / verify-merge / gc) do not apply. Refuse cleanly
@@ -165,7 +210,8 @@ def up(
     ),
     branch: str = typer.Option(DEFAULT_BRANCH, help="Branch for the worktree."),
     path: Path | None = typer.Option(
-        None, help="Worktree path (default: ~/.cache/fr/worktrees/<repo>/<branch>)."
+        None,
+        help="Worktree path (default: ~/.cache/fr/worktrees/<main-checkout>/<branch>).",
     ),
     base: str | None = typer.Option(
         None,
@@ -180,24 +226,47 @@ def up(
         help="Skip git fetch; base a new branch on the local origin/<default> "
         "tracking ref (or HEAD if absent).",
     ),
+    session: str | None = typer.Option(
+        None, "--session", help="Bind this agent session to the new workspace (one CLI call)."
+    ),
+    harness: str = typer.Option(
+        "unknown", "--harness", help="claude | hermes | opencode | unknown (with --session)."
+    ),
+    print_path: bool = typer.Option(
+        False,
+        "--print-path",
+        help="Print ONLY the worktree path on stdout (last line); everything else "
+        "to stderr. For WorktreeCreate hooks.",
+    ),
 ) -> None:
-    """Create worktree + start the profile's devcontainer against it."""
+    """Create worktree + start the profile's devcontainer against it.
+
+    With --print-path (spec 2026-09-04 §5.B.3) the LAST non-empty stdout line
+    is the worktree path — the contract a WorktreeCreate hook relies on — and
+    the human-facing lines move to stderr.
+    """
     try:
         state = _target(repo).up(
             profile=profile, branch=branch, path=path, base=base, no_fetch=no_fetch
         )
+        if session:
+            state = _sessions.attach(state.repo_root, state.branch, session, harness=harness)
     except IsolationError as err:
         _fail(err)
         return
     typer.echo(
-        f"isolation up: worktree={state.worktree} profile={state.profile} branch={state.branch}"
+        f"isolation up: worktree={state.worktree} profile={state.profile} branch={state.branch}",
+        err=print_path,
     )
     if os.environ.get("CLAUDECODE"):
         typer.echo(
             "tip: register the worktree as a Claude Code working directory so the "
             "shell cwd persists there (no more `cd <worktree> && …` for host git/gh):\n"
-            f"    /add-dir {state.worktree}"
+            f"    /add-dir {state.worktree}",
+            err=print_path,
         )
+    if print_path:
+        typer.echo(str(state.worktree))
 
 
 @isolation_app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -214,27 +283,7 @@ def exec(  # noqa: A001 - typer command name
     # workspace instead of a hardcoded vk-iso/work default — so `exec` after an
     # `up --branch feat/x` targets the workspace the operator actually has,
     # never a phantom default. Mirrors `status`/`down`'s no-branch handling.
-    if branch is None:
-        states = list_states(root)
-        if len(states) > 1:
-            _fail(
-                IsolationError(
-                    "multiple isolation workspaces — specify --branch: "
-                    + ", ".join(s.branch for s in states)
-                )
-            )
-            return
-        state = states[0] if states else None
-    else:
-        state = load_state(root, branch)
-    if state is None:
-        msg = (
-            f"no isolation workspace for branch {branch!r} — run `fr isolation up` first."
-            if branch is not None
-            else "no isolation workspace — run `fr isolation up` first."
-        )
-        _fail(IsolationError(msg))
-        return
+    state = _resolve_single(root, branch)
     argv = list(ctx.args)
     if argv and argv[0] == "--":
         argv = argv[1:]
@@ -263,28 +312,7 @@ def restart(
     """
     root = _resolve_repo(repo)
     # Mirror exec's no-branch resolution: the single active workspace, or error.
-    if branch is None:
-        states = list_states(root)
-        if len(states) > 1:
-            _fail(
-                IsolationError(
-                    "multiple isolation workspaces — specify --branch: "
-                    + ", ".join(s.branch for s in states)
-                )
-            )
-            return
-        state = states[0] if states else None
-    else:
-        state = load_state(root, branch)
-    if state is None:
-        _fail(
-            IsolationError(
-                f"no isolation workspace for branch {branch!r} — run `fr isolation up` first."
-                if branch is not None
-                else "no isolation workspace — run `fr isolation up` first."
-            )
-        )
-        return
+    state = _resolve_single(root, branch)
     try:
         container = _target(root).restart(state, force=force)
     except IsolationError as err:
@@ -312,8 +340,11 @@ def status(
         "the correct host-side push workflow. Never prints key material or "
         "token/socket contents.",
     ),
+    session: str | None = typer.Option(
+        None, "--session", help="Only the workspace this session is bound to."
+    ),
 ) -> None:
-    """Show worktree, container, and PR state for isolation workspaces."""
+    """Show worktree, container, PR, and bound-session state for isolation workspaces."""
     root = _resolve_repo(repo)
     states = (
         [s for s in [load_state(root, branch)] if s is not None] if branch else list_states(root)
@@ -321,10 +352,14 @@ def status(
     if branch and not states:
         _fail(IsolationError(f"no isolation workspace for branch {branch!r}."))
         return
+    if session:
+        states = [s for s in states if any(b.session_id == session for b in s.sessions)]
     target = _target_or_exit(root)
     if stats or push_check:
         _refuse_no_docker_status_extras(target)
     rows = [target.status(s) for s in states]
+    for row, s in zip(rows, states):
+        row["sessions"] = [b.model_dump() for b in s.sessions]
     if stats:
         for row, s in zip(rows, states):
             row["stats"] = target.stats(s)
@@ -349,6 +384,7 @@ def status(
             line += (
                 f" stats=cpu={st['cpu']} mem={st['mem']} ({st['mem_perc']})" if st else " stats=n/a"
             )
+        line += f" sessions={','.join(b['session_id'] for b in r['sessions']) or 'none'}"
         typer.echo(line)
         if push_check:
             pc = r.get("push_check")
@@ -374,8 +410,22 @@ def down(
         help="Tear down EVERY workspace for the repo and clear the pipeline "
         "sentinel(s) — the escape from an orphaned-sentinel deadlock (#341).",
     ),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="The calling session; excluded from the still-attached warning.",
+    ),
+    worktree: Path | None = typer.Option(
+        None,
+        "--worktree",
+        help="Resolve the workspace by its worktree path (WorktreeRemove hooks).",
+    ),
 ) -> None:
     """Stop the container, remove the worktree, drop the state.
+
+    With --worktree <path> (spec 2026-09-04 §5.B.4), resolve the workspace by
+    its worktree path instead of --repo/--branch — the caller (a WorktreeRemove
+    hook) only knows the path and may run from any cwd.
 
     With --branch omitted, resolve to the single active workspace — so bare
     `down` from inside a worktree tears down the workspace the operator actually
@@ -383,38 +433,34 @@ def down(
 
     With --all, ignore --branch: tear down all workspaces (keeping any with an
     OPEN PR unless --force) and clear this repo's pipeline sentinel(s).
+
+    Bound sessions (spec 2026-09-04 §5.A): every session attached to the
+    workspace is unbound; those other than `--session` are named in a warning
+    (never a refusal — liveness is unknowable here).
     """
-    root = _resolve_repo(repo)
-    if all_:
-        _down_all(root, force=force)
-        return
-    if branch is None:
-        states = list_states(root)
-        if len(states) > 1:
-            _fail(
-                IsolationError(
-                    "multiple isolation workspaces — specify --branch: "
-                    + ", ".join(s.branch for s in states)
-                )
-            )
-            return
-        state = states[0] if states else None
+    if worktree is not None:
+        state = _resolve_by_worktree(worktree)
+        root = state.repo_root
     else:
-        state = load_state(root, branch)
-    if state is None:
-        _fail(
-            IsolationError(
-                f"no isolation workspace for branch {branch!r}."
-                if branch is not None
-                else "no isolation workspace — run `fr isolation up` first."
-            )
+        root = _resolve_repo(repo)
+        if all_:
+            _down_all(root, force=force)
+            return
+        state = _resolve_single(root, branch)
+    others = [b.session_id for b in state.sessions if b.session_id != session]
+    if others:
+        typer.echo(
+            f"warning: sessions still attached: {', '.join(others)} — they will be detached",
+            err=True,
         )
-        return
     try:
         _target(root).down(state, force=force)
     except IsolationError as err:
         _fail(err)
         return
+    # Only after a SUCCESSFUL teardown: a refused `down` (open PR) keeps the
+    # workspace, so it keeps its bindings too.
+    _sessions.detach_all(state)
     # #399: when this was the last workspace, clear the pipeline sentinel(s)
     # eagerly. The bash guard's own clear can't fire here — it exits early when
     # `down` runs from the worktree cwd (the prescribed workflow), so the guard
@@ -443,12 +489,60 @@ def _down_all(root: Path, force: bool) -> None:
             torn.append(state.branch)
         except IsolationError:
             kept.append(state.branch)
+            continue
+        _sessions.detach_all(state)  # kept workspaces keep their bindings
     cleared = clear_repo_sentinels(root)
     summary = f"isolation down --all: {len(torn)} torn down"
     if kept:
         summary += f", {len(kept)} kept (open PR — rerun with --force): {', '.join(kept)}"
     summary += f", {cleared} sentinel(s) cleared."
     typer.echo(summary)
+
+
+@isolation_app.command()
+def attach(
+    session: str = typer.Option(
+        ..., "--session", help="Agent session id (from the harness hook payload)."
+    ),
+    repo: Path = typer.Option(Path("."), help="Repo root (default: cwd)."),
+    branch: str | None = typer.Option(
+        None, help="Isolation branch (default: the single active workspace)."
+    ),
+    harness: str = typer.Option("unknown", help="claude | hermes | opencode | unknown"),
+) -> None:
+    """Bind a session to a workspace (traceability; idempotent).
+
+    A session holds at most one binding — attaching elsewhere moves it. State
+    (IsolationState.sessions) is the source of truth; the per-session index
+    under ~/.cache/fr/sessions/ is derived (spec 2026-09-04 §5.A, decision d1).
+    """
+    root = _resolve_repo(repo)
+    state = _resolve_single(root, branch)
+    try:
+        _sessions.attach(root, state.branch, session, harness=harness)
+    except IsolationError as err:
+        _fail(err)
+        return
+    typer.echo(f"attached {session} -> {state.branch}")
+
+
+@isolation_app.command()
+def detach(
+    session: str = typer.Option(..., "--session", help="Agent session id to unbind."),
+    repo: Path | None = typer.Option(
+        None, help="Limit to this repo (default: wherever the session is bound)."
+    ),
+    branch: str | None = typer.Option(None, help="Limit to this branch (with --repo)."),
+) -> None:
+    """Unbind a session (idempotent; exit 0 when nothing was bound)."""
+    try:
+        gone = _sessions.detach(session, repo_root=repo.resolve() if repo else None, branch=branch)
+    except IsolationError as err:
+        _fail(err)
+        return
+    typer.echo(
+        f"detached {session} <- {', '.join(gone)}" if gone else f"detached {session} (no binding)"
+    )
 
 
 @isolation_app.command(name="verify-merge")

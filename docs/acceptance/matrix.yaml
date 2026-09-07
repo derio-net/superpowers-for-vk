@@ -1421,6 +1421,117 @@ rows:
       modelled on the real agent-worktree-required.sh which carries the exempt list
       twice. Verified against a copy of the live hook: exactly one line changes (the
       message), the read-only rationale comment is untouched, second run byte-identical.'
+  - id: session-workspace-binding
+    capability: isolation-traceability
+    acceptance: An operator can ask fr which workspace an agent session is attached
+      to, and which sessions hold a workspace, without inspecting the harness.
+    origin:
+    - super-fr:docs/superpowers/specs/2026-09-04-worktree-traceability-design.md
+    levels:
+      unit:
+      - super-fr:tests/unit/test_isolation_sessions.py
+      - super-fr:tests/unit/test_isolation_sessions_cmd.py
+      int:
+      - super-fr:tests/unit/test_hooks_session_bind.py
+    status: ci
+    notes: 'Unit level (phase 1): fr.isolation.sessions attach/detach/detach_all/stale
+      index classification, IsolationState.sessions round-trip, and the CLI surface
+      (attach, detach, status --session / sessions column, up --session, down unbind +
+      warning) pinned per-PR. Hook level (phase 3, filed under int because the matrix
+      has no hook level): fr-session-bind.sh (PostToolUse Bash -> attach on up/exec
+      with and without a leading cd, detach on down, subagent and non-Bash input
+      ignored) and fr-session-unbind.sh (SessionEnd -> detach, resume kept) exercised
+      via subprocess against a stub fr that records argv.'
+  - id: statusline-shows-bound-workspace
+    capability: isolation-traceability
+    acceptance: The Claude Code status line shows the session isolation path alongside
+      the checked-out branch and cwd, and lists the repo other worktrees, well inside one status-line refresh
+      (about 100 ms warm on the operator Mac; 0.5 s CI guard).
+    origin:
+    - super-fr:docs/superpowers/specs/2026-09-04-worktree-traceability-design.md
+    levels:
+      int:
+      - super-fr:tests/unit/test_statusline_segment.py
+    status: ci
+    notes: 'Segment script plugins/super-fr/scripts/fr-statusline-segment.sh (phase 5,
+      filed under int because the matrix has no golden level): golden outputs for
+      bound / unbound / inside-workspace / non-repo / detached-HEAD / width-bounded
+      shapes via subprocess, a 0.5 s CI timing guard (about 100 ms warm on the operator
+      Mac with a real git first on PATH; see journal 9ecae0965ac4), and a trap fr on PATH proving the fr CLI is never invoked. Operator-side
+      wiring (~/.claude/statusline.sh calling the segment) is phase 7.'
+  - id: native-worktree-sessions-land-in-fr
+    capability: isolation-conformity
+    acceptance: claude --worktree <name> and EnterWorktree in an fr-enabled repo create
+      an fr workspace at the fr location with the session bound; subagent worktrees
+      keep the Claude default shape.
+    origin:
+    - super-fr:docs/superpowers/specs/2026-09-04-worktree-traceability-design.md
+    levels:
+      unit:
+      - super-fr:tests/unit/test_isolation_sessions_cmd.py
+      int:
+      - super-fr:tests/unit/test_hooks_worktree.py
+    status: ci
+    notes: 'Unit level (phase 4): fr isolation up --print-path (last non-empty stdout
+      line is the worktree path, human lines on stderr, idempotent for an existing
+      branch+worktree) and fr isolation down --worktree <path> (resolves the workspace
+      by worktree path from any cwd; unknown path exits 2). Hook level (filed under int
+      because the matrix has no hook level): fr-worktree-create.sh (WorktreeCreate ->
+      fr isolation up --repo --branch wt/<name>|<name-with-slash> --session --harness
+      claude --print-path in an fr-enabled repo, FR_ISOLATION_TARGET=worktree exported
+      when no devcontainer profile; agent-* names and non-fr repos reproduce the Claude
+      default <repo>/.claude/worktrees/<name> detached worktree; non-git cwd exits 1)
+      and fr-worktree-remove.sh (WorktreeRemove -> git worktree remove for agent-*,
+      else fr isolation down --worktree, refusal reported on stderr with exit 0)
+      exercised via subprocess against a stub fr that records argv.'
+  - id: nested-up-files-under-main-checkout
+    capability: isolation-conformity
+    acceptance: fr isolation up run from inside any worktree of a repo files the workspace
+      under the main checkout name.
+    origin:
+    - super-fr:docs/superpowers/specs/2026-09-04-worktree-traceability-design.md
+    levels:
+      unit:
+      - super-fr:tests/unit/test_isolation_repo_key.py
+    status: ci
+    notes: 'Unit level (phase 2): repo_cache_name resolves the main checkout basename
+      for the main checkout, a native agent worktree (<repo>/.claude/worktrees/agent-*)
+      and a nested worktree elsewhere, falling back to the basename outside git; a
+      host-mode `up` launched from inside the agent worktree lands under
+      ~/.cache/fr/worktrees/<main-checkout>/<branch>, never under agent-*. Pinned per-PR.'
+  - id: gc-reaps-empty-repo-dirs
+    capability: isolation-hygiene
+    acceptance: fr isolation gc removes empty repo folders and stale session files from
+      the fr cache.
+    origin:
+    - super-fr:docs/superpowers/specs/2026-09-04-worktree-traceability-design.md
+    levels:
+      unit:
+      - super-fr:tests/unit/test_isolation_gc_hygiene.py
+    status: ci
+    notes: 'Unit level (phase 2): gc verdicts `empty-repo-dir` (a child of
+      ~/.cache/fr/worktrees with no subdirectories is removed; files alone do not make
+      it live; populated repo dirs are kept) and `stale-session` (index whose worktree
+      is gone or whose state no longer lists the session is unlinked; a healthy index
+      and its state binding survive), both with `--dry-run` reporting `would-remove`
+      and mutating nothing. Pinned per-PR in host-worktree mode.'
+  - id: superpowers-worktree-skill-routed-to-fr
+    capability: isolation-conformity
+    acceptance: In an fr-enabled repo, a request that would invoke using-git-worktrees
+      is routed to fr-isolation; no .worktrees directory is created.
+    origin:
+    - super-fr:docs/superpowers/specs/2026-09-04-worktree-traceability-design.md
+    levels:
+      unit:
+      - super-fr:tests/unit/test_tripwire_worktrees_dir.py
+    status: ci
+    notes: 'Rule + tripwire (phase 6): the routing claim itself lives in the rule text
+      plugins/super-fr/rules/fr-worktree-override.md (installed to ~/.claude/rules by
+      install.sh, mirrored to .opencode/instructions and the Hermes SOUL block), and a
+      rule is prose the harness follows, not code a test can execute. The unit tripwire
+      pins what CAN be checked: the rule exists and carries the claim (using-git-worktrees,
+      fr isolation up --branch, never create .worktrees/), git ls-files has no path with a
+      .worktrees or .claude/worktrees component, and .gitignore lists both. Pinned per-PR.'
   - id: artifacts-migrate-on-next-command
     capability: Artifact migration
     acceptance: An operator whose fr version changed under in-flight work has their

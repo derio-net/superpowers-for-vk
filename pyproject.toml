@@ -3,7 +3,7 @@
 # both plugin manifests; the version-sync CI job checks the set.
 [project]
 name = "super-fr-workspace"
-version = "4.0.0"
+version = "4.1.0"
 description = "super-fr workspace root (fr / fr-dispatch / fr-vk / fr-cncd)"
 requires-python = ">=3.11"
 dependencies = ["fr", "fr-dispatch", "fr-vk", "fr-cncd"]

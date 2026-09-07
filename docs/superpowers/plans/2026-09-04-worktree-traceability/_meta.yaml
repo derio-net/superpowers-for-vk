@@ -1,0 +1,6 @@
+schema_version: 2
+plan: 2026-09-04-worktree-traceability
+spec: docs/superpowers/specs/2026-09-04-worktree-traceability-design.md
+target_repo: derio-net/super-fr
+fr_version: '>=3.0.0,<5.0.0'
+created: '2026-09-05'

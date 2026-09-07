@@ -216,6 +216,21 @@ host-visible); every build, test, lint, and run command goes through
 linked PR is still open (unless `--force`), so cleanup can't race the
 operator's final pushes.
 
+**Where worktrees live.** Four things create worktrees; fr owns or routes all
+of them, and knows which agent session holds each workspace:
+
+| Creator | Location | State / session link |
+|---|---|---|
+| `fr isolation up` | `~/.cache/fr/worktrees/<main-checkout>/<branch-slug>` (keyed on the main checkout even when run from inside another worktree) | `<common-dir>/fr/isolation/<slug>.json` + per-session index `~/.cache/fr/sessions/<session-id>.json` |
+| Claude native (`claude --worktree <name>`, `EnterWorktree`, desktop) | same fr location, branch `wt/<name>` — the `WorktreeCreate` hook calls `fr isolation up --session --print-path` | fr state, session bound in the same call |
+| Agent tool `isolation: "worktree"` (`agent-*` names) | `<repo>/.claude/worktrees/agent-<id>` — Claude's default shape, reproduced by the same hook on purpose | Claude-internal (subagent only) |
+| superpowers `using-git-worktrees` | routed to `fr isolation up` by the shipped rule `fr-worktree-override.md`; `<repo>/.worktrees/` is never created (CI tripwire) | fr state |
+
+`fr isolation status` lists the sessions holding each workspace; the shipped
+`plugins/super-fr/scripts/fr-statusline-segment.sh` renders the bound
+workspace and the repo's other worktrees in the Claude Code status line
+(wiring in the fr-isolation skill, "Session bindings").
+
 A repo without a profile is a blocker, not a degraded mode: the `fr-init`
 skill scans the repo, interviews the operator (profiles, tools, credential
 key names, working patterns), and scaffolds profiles via `fr init scaffold`.
@@ -232,7 +247,7 @@ Everyday:
 | `fr apply` | Render + observe + diff + apply a plan to the repo's git host (dry-run by default; `--to <runner>` queues phases) |
 | `fr status` | Read-only plan report (allowlist-safe; never mutates) |
 | `fr acceptance` | Acceptance-matrix registry: `init`, `backfill`, `add`, `check`, `status`, `report` — see [Acceptance matrix](#acceptance-matrix) |
-| `fr isolation` | Isolated workspaces: `up`, `exec`, `status`, `down` |
+| `fr isolation` | Isolated workspaces: `up`, `exec`, `status`, `attach`, `detach`, `down`, `gc` |
 | `fr plan` | Plan editing: `create`, `edit` (tick steps, complete phases), `self-review`, `rework` |
 | `fr archive` | Move finished plans (and specs) to `implemented/` |
 | `fr skills` | Condensed overview of the skills + CLI surface |

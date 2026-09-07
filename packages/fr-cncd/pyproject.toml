@@ -1,6 +1,6 @@
 [project]
 name = "fr-cncd"
-version = "4.0.0"
+version = "4.1.0"
 description = "super-fr cncd adapter: thin HTTP runner projecting plans into the cncd ledger (POST /v1/ingest)"
 requires-python = ">=3.11"
 dependencies = ["fr", "fr-dispatch"]

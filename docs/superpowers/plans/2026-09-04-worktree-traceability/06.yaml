@@ -1,0 +1,103 @@
+schema_version: 2
+phase:
+  number: 6
+  title: Conformity + docs — fr-worktree-override rule, install wiring, .worktrees
+    tripwire, skill/README docs
+  tag: agentic
+  depends_on:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  tracking_issue: null
+  acceptance:
+  - superpowers-worktree-skill-routed-to-fr
+tasks:
+- number: 1
+  title: RED — tripwire + install assertions
+  steps:
+  - id: P6.T1.S1
+    text: |
+      RED: create tests/unit/test_tripwire_worktrees_dir.py mirroring
+      test_tripwire_isolation_marker.py: `git ls-files` must contain no path with a
+      `.worktrees` or `.claude/worktrees` component (helper `tracked_under(names, component)`
+      with two pure unit cases + the git-backed case), and the repo `.gitignore` must contain
+      both `.worktrees/` and `.claude/worktrees/` lines. Also grep tests/ for
+      "no-claude-p-batch.md" to find where rule installation is asserted (install.sh /
+      Hermes rules sync); add `fr-worktree-override.md` to those expectations. Run, confirm
+      failures (rule file missing, .gitignore lines missing).
+- number: 2
+  title: GREEN — rule, install.sh, .gitignore
+  steps:
+  - id: P6.T2.S1
+    text: |
+      GREEN: create plugins/super-fr/rules/fr-worktree-override.md:
+
+      # Worktree Skill Override (fr-enabled repos)
+
+      In a repo with fr plans (`docs/superpowers/plans/`) or devcontainer profiles
+      (`.devcontainer/<profile>/`), any skill or instruction that would invoke
+      `superpowers:using-git-worktrees` — "work in a worktree", "isolate this",
+      executing-plans' isolation step — invokes `fr-isolation` instead:
+
+          fr isolation up --branch <feat/slug>
+
+      Never create `<repo>/.worktrees/`. fr owns the location
+      (`~/.cache/fr/worktrees/<main-checkout>/<branch-slug>`), the state, and the
+      session binding (`fr isolation status` shows which sessions hold a workspace).
+
+      `claude --worktree <name>` and the `EnterWorktree` tool need no override:
+      super-fr's `WorktreeCreate` hook already lands them in fr (subagent worktrees,
+      `agent-*`, keep Claude's default shape on purpose). Plain
+      `using-git-worktrees` remains for non-fr repos.
+
+      In scripts/install.sh add after the no-claude-p-batch.md cp:
+      `cp "$PLUGIN_ROOT/plugins/super-fr/rules/fr-worktree-override.md" "$RULES_DIR/fr-worktree-override.md"`
+      `echo "  Installed $RULES_DIR/fr-worktree-override.md (worktree-skill routing)"`
+      and in the uninstall block next to the fr-plan-override rm: `rm -f "$RULES_DIR/fr-worktree-override.md"`.
+      Append `.worktrees/` and `.claude/worktrees/` to .gitignore if missing. If the Hermes
+      rules-sync tripwire enumerates plugin rules, add the new rule to its source list
+      (`fr hermes install` block generator) the same way the other three are listed.
+      Run Task 1 tests + the whole unit suite, confirm green.
+- number: 3
+  title: Docs
+  steps:
+  - id: P6.T3.S1
+    text: |
+      Docs: (1) plugins/super-fr/skills/fr-isolation/SKILL.md — new section
+      "## Session bindings (traceability)" after "Exec-bridge discipline": attach/detach verbs,
+      `~/.cache/fr/sessions/<id>.json` shape, `status --session`, `up --session/--print-path`,
+      `down --worktree`, the Claude hooks that call them, and this operator status-line snippet:
+
+          # ~/.claude/statusline.sh — line 2/3 (after computing $branch_str and $cwd_str)
+          seg=$(printf '%s' "$data" | bash ~/.claude/plugins/cache/derio-net--super-fr/super-fr/current/scripts/fr-statusline-segment.sh)
+          iso_line=$(printf '%s\n' "$seg" | sed -n '1p'); wt_line=$(printf '%s\n' "$seg" | sed -n '2p')
+          line2="${branch_str}${SEP}${cwd_str}"; [ -n "$iso_line" ] && line2="${line2}${SEP}${DIM}${iso_line}${RESET}"
+          echo -e "$line2"; [ -n "$wt_line" ] && echo -e "${DIM}${wt_line}${RESET}"
+
+      (2) plugins/super-fr/rules/fr-isolation-required.md — one paragraph under "Scope":
+      session bindings are traceability, not enforcement; the edit gate is unchanged.
+      (3) README isolation section — the four-creators table from the spec §2 with the
+      "after" column (fr / fr via WorktreeCreate / Claude default for agent-* / routed to fr).
+      (4) `fr skills` overview text if it lists isolation verbs (grep for "isolation exec" in
+      packages/fr/src/fr/commands). Run the unit suite once more (docs tripwires). Commit:
+      `docs+rules: fr-worktree-override, session-binding docs, worktree conformity table`.
+state:
+  steps:
+    P6.T1.S1:
+      state: x
+      ticked_at: '2026-09-05T21:22:54+00:00'
+      note: null
+    P6.T2.S1:
+      state: x
+      ticked_at: '2026-09-05T21:26:22+00:00'
+      note: null
+    P6.T3.S1:
+      state: x
+      ticked_at: '2026-09-05T21:32:49+00:00'
+      note: null
+  completion:
+    at: '2026-09-05T21:33:37+00:00'
+    note: null
+    observed_prs: []
